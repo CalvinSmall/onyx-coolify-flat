@@ -2,14 +2,8 @@ version: '3.8'
 
 # ============================================
 # ONYX LITE + CRAFT + MISTRAL + BASIC AUTH
-# Complete production-ready deployment
-# Features:
-#   - Local Docker builds (no registry dependencies)
-#   - Lite mode (no Vespa, uses pgvector)
-#   - Mistral AI for LLM + embeddings (1024d)
-#   - Craft AI sandbox enabled
-#   - Basic Auth (email/password, no Google OAuth)
-#   - Coolify optimized
+# Coolify-native: Uses Coolify's built-in reverse proxy
+# No nginx container needed
 # ============================================
 
 networks:
@@ -29,28 +23,8 @@ volumes:
 
 services:
   # ==========================================
-  # NGINX REVERSE PROXY
-  # ==========================================
-  nginx:
-    image: nginx:1.23-alpine
-    container_name: onyx-nginx
-    restart: unless-stopped
-    ports:
-      - "80:80"
-    volumes:
-      - ../data/nginx:/etc/nginx/conf.d:ro
-    depends_on:
-      - api_server
-      - web_server
-    networks:
-      onyx-network:
-        ipv4_address: 172.28.0.2
-    security_opt:
-      - no-new-privileges:true
-
-  # ==========================================
   # WEB FRONTEND (Next.js) - BUILT LOCALLY
-  # Build context: ../../web (relative to deployment/docker_compose/)
+  # Coolify will route HTTP/HTTPS to port 3000
   # ==========================================
   web_server:
     build:
@@ -62,6 +36,7 @@ services:
     image: onyx-dot-app/onyx-web:${IMAGE_TAG:-latest}
     container_name: onyx-web
     restart: unless-stopped
+    # Coolify routes to this port via its proxy (Caddy/Traefik)
     expose:
       - "3000"
     environment:
@@ -70,7 +45,7 @@ services:
       WEB_DOMAIN: ${WEB_DOMAIN:-http://localhost:3000}
       HEADER_DOMAIN: ${DOMAIN:-localhost}
       
-      # API backend connection
+      # API backend connection (internal, not exposed)
       INTERNAL_URL: http://api_server:8080
       
       # File upload limits
@@ -104,7 +79,7 @@ services:
 
   # ==========================================
   # API SERVER (Python/FastAPI) - BUILT LOCALLY
-  # Build context: ../../backend (relative to deployment/docker_compose/)
+  # Not exposed directly; accessed via web_server internally
   # ==========================================
   api_server:
     build:
@@ -137,7 +112,7 @@ services:
       DISABLE_INDEXING: "false"
       
       # ========================================
-      # POSTGRESQL DATABASE (application data)
+      # POSTGRESQL (application data)
       # ========================================
       POSTGRES_HOST: relational_db
       POSTGRES_PORT: "5432"
@@ -146,14 +121,13 @@ services:
       POSTGRES_DB: postgres
       
       # ========================================
-      # VECTOR DATABASE (pgvector for embeddings)
-      # Lite mode: pgvector replaces Vespa
+      # VECTOR DATABASE (pgvector - Lite mode)
       # ========================================
       VESPA_HOST: ""
       VESPA_PORT: ""
       
       # ========================================
-      # REDIS (cache & message queue)
+      # REDIS
       # ========================================
       REDIS_HOST: cache
       REDIS_PORT: "6379"
@@ -168,7 +142,7 @@ services:
       MISTRAL_ENDPOINT: ${MISTRAL_ENDPOINT:-}
       
       # ========================================
-      # MISTRAL AI - EMBEDDINGS (1024 dimensions)
+      # MISTRAL AI - EMBEDDINGS (1024d)
       # ========================================
       EMBEDDING_PROVIDER: mistral
       EMBEDDING_MODEL: mistral-embed
@@ -203,7 +177,7 @@ services:
       LOG_BACKUP_COUNT: "5"
       
       # ========================================
-      # PERFORMANCE TUNING
+      # PERFORMANCE
       # ========================================
       DISABLE_LLM_CHOOSE_SEARCH: "false"
       INDEXING_INFO_CACHE_CAPACITY: "10000"
@@ -244,7 +218,8 @@ services:
 
   # ==========================================
   # BACKGROUND WORKER (Celery)
-  # Reuses the locally built onyx-backend image
+  # Reuses locally built onyx-backend image
+  # No ports exposed - internal only
   # ==========================================
   background:
     image: onyx-dot-app/onyx-backend:${IMAGE_TAG:-latest}
@@ -341,7 +316,7 @@ services:
 
   # ==========================================
   # CRAFT SERVICE (AI Sandbox)
-  # Uses pre-built image (ghcr.io) - no local build available
+  # No ports exposed to internet - internal only
   # ==========================================
   craft-service:
     image: ghcr.io/onyx-dot-app/onyx-craft:latest
@@ -390,7 +365,7 @@ services:
 
   # ==========================================
   # RELATIONAL DATABASE (PostgreSQL 15.2)
-  # Stores application data (users, connectors, etc.)
+  # No ports exposed - internal only
   # ==========================================
   relational_db:
     image: postgres:15.2
@@ -427,8 +402,8 @@ services:
 
   # ==========================================
   # VECTOR DATABASE (pgvector)
-  # Stores Mistral embeddings (1024 dimensions)
-  # Replaces Vespa in Lite mode
+  # Stores Mistral embeddings (1024d)
+  # No ports exposed - internal only
   # ==========================================
   vector:
     image: ankane/pgvector:latest
@@ -465,7 +440,7 @@ services:
 
   # ==========================================
   # CACHE (Redis 7)
-  # Message broker for Celery + general cache
+  # No ports exposed - internal only
   # ==========================================
   cache:
     image: redis:7-alpine
@@ -498,11 +473,3 @@ services:
       timeout: 3s
       retries: 5
       start_period: 5s
-
-  # ==========================================
-  # VOLUME NOTES FOR COOLIFY
-  # Add these persistent volumes in Coolify UI:
-  #   - local_dynamic_storage: 20GB+
-  #   - file_connector_tmp_storage: 10GB
-  #   - craft_sandbox_artifacts: 5GB (may be ephemeral)
-  # ==========================================
