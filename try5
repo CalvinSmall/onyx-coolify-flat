@@ -1,0 +1,351 @@
+version: '3.8'
+
+services:
+  web_server:
+    container_name: onyx-web
+    build:
+      context: ./web
+    image: onyx-dot-app/onyx-web:${IMAGE_TAG:-latest}
+    expose:
+      - "3000"
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+      - WEB_DOMAIN=${WEB_DOMAIN:-localhost}
+      - HEADER_DOMAIN=${HEADER_DOMAIN:-localhost}
+      - INTERNAL_URL=http://api_server:8080
+      - NEXT_PUBLIC_MAX_FILE_SIZE=50000000
+      - NEXT_PUBLIC_MAX_DOCUMENT_SIZE=50000000
+      - NEXT_TELEMETRY_DISABLED=1
+      - ENABLE_CRAFT=true
+    networks:
+      onyx-network:
+        ipv4_address: 172.28.0.10
+    depends_on:
+      - api_server
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    security_opt:
+      - "no-new-privileges:true"
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1GB
+
+  api_server:
+    container_name: onyx-api
+    build:
+      context: ./backend
+    image: onyx-dot-app/onyx-backend:${IMAGE_TAG:-latest}
+    expose:
+      - "8080"
+    environment:
+      - AUTH_TYPE=${AUTH_TYPE:-basic}
+      - REQUIRE_EMAIL_VERIFICATION=${REQUIRE_EMAIL_VERIFICATION:-false}
+      - SECRET=${SECRET}
+      - DOMAIN=${DOMAIN:-localhost}
+      - WEB_DOMAIN=${WEB_DOMAIN:-http://localhost:3000}
+      - ENABLE_LITE=true
+      - USE_VESPA=false
+      - DISABLE_INDEXING=false
+      - POSTGRES_HOST=relational_db
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-password}
+      - POSTGRES_DB=postgres
+      - VESPA_HOST=
+      - VESPA_PORT=
+      - REDIS_HOST=cache
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - GENAI_MODEL_PROVIDER=mistral
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY}
+      - MISTRAL_MODEL=${MISTRAL_MODEL:-mistral-small-latest}
+      - MISTRAL_ENDPOINT=${MISTRAL_ENDPOINT:-}
+      - EMBEDDING_PROVIDER=mistral
+      - EMBEDDING_MODEL=mistral-embed
+      - MISTRAL_EMBEDDING_API_KEY=${MISTRAL_EMBEDDING_API_KEY:-${MISTRAL_API_KEY}}
+      - EMBEDDING_BATCH_SIZE=${EMBEDDING_BATCH_SIZE:-50}
+      - FILE_CONNECTOR_TMP_STORAGE_PATH=/home/file_connector_attachments
+      - STALE_FILE_CLEANUP_DAYS=7
+      - ENABLE_CRAFT=true
+      - CRAFT_SERVICE_URL=http://craft-service:8081
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - ENABLE_TELEMETRY=false
+      - DISABLE_FEEDBACK=true
+      - METRICS_DRIVER=none
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - LOG_MAX_BYTES=10485760
+      - LOG_BACKUP_COUNT=5
+      - DISABLE_LLM_CHOOSE_SEARCH=false
+      - INDEXING_INFO_CACHE_CAPACITY=10000
+    volumes:
+      - local_dynamic_storage:/home/storage
+      - file_connector_tmp_storage:/home/file_connector_attachments
+      - craft_sandbox_artifacts:/tmp/craft_artifacts
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      onyx-network:
+        ipv4_address: 172.28.0.20
+    depends_on:
+      relational_db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+      vector:
+        condition: service_healthy
+      craft-service:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+    security_opt:
+      - "no-new-privileges:true"
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4GB
+        reservations:
+          cpus: "0.5"
+          memory: 1GB
+
+  background:
+    container_name: onyx-background
+    build:
+      context: ./backend
+    image: onyx-dot-app/onyx-backend:${IMAGE_TAG:-latest}
+    expose:
+      - "8080"
+    environment:
+      - AUTH_TYPE=${AUTH_TYPE:-basic}
+      - REQUIRE_EMAIL_VERIFICATION=${REQUIRE_EMAIL_VERIFICATION:-false}
+      - SECRET=${SECRET}
+      - DOMAIN=${DOMAIN:-localhost}
+      - WEB_DOMAIN=${WEB_DOMAIN:-http://localhost:3000}
+      - ENABLE_LITE=true
+      - USE_VESPA=false
+      - DISABLE_INDEXING=false
+      - POSTGRES_HOST=relational_db
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-password}
+      - POSTGRES_DB=postgres
+      - VESPA_HOST=
+      - VESPA_PORT=
+      - REDIS_HOST=cache
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - GENAI_MODEL_PROVIDER=mistral
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY}
+      - MISTRAL_MODEL=${MISTRAL_MODEL:-mistral-small-latest}
+      - MISTRAL_ENDPOINT=${MISTRAL_ENDPOINT:-}
+      - EMBEDDING_PROVIDER=mistral
+      - EMBEDDING_MODEL=mistral-embed
+      - MISTRAL_EMBEDDING_API_KEY=${MISTRAL_EMBEDDING_API_KEY:-${MISTRAL_API_KEY}}
+      - EMBEDDING_BATCH_SIZE=${EMBEDDING_BATCH_SIZE:-50}
+      - FILE_CONNECTOR_TMP_STORAGE_PATH=/home/file_connector_attachments
+      - STALE_FILE_CLEANUP_DAYS=7
+      - ENABLE_CRAFT=true
+      - CRAFT_SERVICE_URL=http://craft-service:8081
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - ENABLE_TELEMETRY=false
+      - DISABLE_FEEDBACK=true
+      - METRICS_DRIVER=none
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - LOG_MAX_BYTES=10485760
+      - LOG_BACKUP_COUNT=5
+      - DISABLE_LLM_CHOOSE_SEARCH=false
+      - INDEXING_INFO_CACHE_CAPACITY=10000
+    volumes:
+      - local_dynamic_storage:/home/storage
+      - file_connector_tmp_storage:/home/file_connector_attachments
+      - craft_sandbox_artifacts:/tmp/craft_artifacts
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      onyx-network:
+        ipv4_address: 172.28.0.30
+    depends_on:
+      relational_db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+      vector:
+        condition: service_healthy
+      craft-service:
+        condition: service_started
+    command: >
+      /bin/sh -c "echo 'Running database migrations...' &&
+      alembic upgrade head &&
+      echo 'Starting Celery workers...' &&
+      celery -A onyx.background.celery worker --pool=threads --concurrency=6
+      --loglevel=INFO -Q celery,celery:2,celery:3,check_for_signals
+      -n background@%h"
+    restart: unless-stopped
+    security_opt:
+      - "no-new-privileges:true"
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 4GB
+
+  craft-service:
+    container_name: onyx-craft
+    build:
+      context: ./craft
+    image: onyx-dot-app/onyx-craft:${IMAGE_TAG:-latest}
+    expose:
+      - "8081"
+    environment:
+      - PORT=8081
+      - SANDBOX_TIMEOUT=${CRAFT_TIMEOUT:-120}
+      - MAX_MEMORY_MB=${CRAFT_MAX_MEMORY:-512}
+      - MAX_OUTPUT_LENGTH=10000
+      - WHITELISTED_MODULES=numpy,pandas,matplotlib,requests,beautifulsoup4,scipy,scikit-learn,json,re,collections,itertools,math,random,statistics
+      - DISABLE_NETWORKING=${CRAFT_DISABLE_NETWORK:-false}
+      - ALLOWED_HOSTS=${DOMAIN:-localhost},api.mistral.ai,*.mistral.ai
+      - LOG_LEVEL=INFO
+    volumes:
+      - craft_sandbox_artifacts:/tmp/craft_artifacts:rw
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      onyx-network:
+        ipv4_address: 172.28.0.40
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8081/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    restart: unless-stopped
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 1GB
+
+  relational_db:
+    container_name: onyx-postgres
+    image: postgres:15.2
+    expose:
+      - "5432"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-password}
+      - POSTGRES_DB=postgres
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - local_dynamic_storage:/var/lib/postgresql/data
+    networks:
+      onyx-network:
+        ipv4_address: 172.28.0.50
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    security_opt:
+      - "no-new-privileges:true"
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 2GB
+        reservations:
+          cpus: "0.5"
+          memory: 1GB
+
+  vector:
+    container_name: onyx-vector
+    image: ankane/pgvector:latest
+    expose:
+      - "5432"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-password}
+      - POSTGRES_DB=postgres
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    volumes:
+      - local_dynamic_storage:/var/lib/postgresql/data
+    networks:
+      onyx-network:
+        ipv4_address: 172.28.0.60
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    security_opt:
+      - "no-new-privileges:true"
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 2GB
+        reservations:
+          cpus: "0.5"
+          memory: 1GB
+
+  cache:
+    container_name: onyx-redis
+    image: redis:7-alpine
+    expose:
+      - "6379"
+    command: >
+      redis-server --requirepass ${REDIS_PASSWORD:-}
+      --maxmemory 512mb --maxmemory-policy allkeys-lru
+      --appendonly yes --appendfsync everysec
+    volumes:
+      - local_dynamic_storage:/data
+    networks:
+      onyx-network:
+        ipv4_address: 172.28.0.70
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a ${REDIS_PASSWORD:-} ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    security_opt:
+      - "no-new-privileges:true"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512MB
+
+networks:
+  onyx-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  local_dynamic_storage:
+  file_connector_tmp_storage:
+  craft_sandbox_artifacts:
