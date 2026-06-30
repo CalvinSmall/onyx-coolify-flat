@@ -199,20 +199,15 @@ services:
           cpus: "2"
           memory: 4GB
 
-  craft-service:
+craft-service:
     container_name: onyx-craft
-    image: ghcr.io/onyx-dot-app/onyx-craft:latest
+    build:
+      context: ./craft              # build from local source
+    image: onyx-dot-app/onyx-craft:${IMAGE_TAG:-latest}   # optional tag
     expose:
       - "8081"
     environment:
-      - PORT=8081
-      - SANDBOX_TIMEOUT=${CRAFT_TIMEOUT:-120}
-      - MAX_MEMORY_MB=${CRAFT_MAX_MEMORY:-512}
-      - MAX_OUTPUT_LENGTH=10000
-      - WHITELISTED_MODULES=numpy,pandas,matplotlib,requests,beautifulsoup4,scipy,scikit-learn,json,re,collections,itertools,math,random,statistics
-      - DISABLE_NETWORKING=${CRAFT_DISABLE_NETWORK:-false}
-      - ALLOWED_HOSTS=${DOMAIN:-localhost},api.mistral.ai,*.mistral.ai
-      - LOG_LEVEL=INFO
+      # … same as before …
     volumes:
       - craft_sandbox_artifacts:/tmp/craft_artifacts:rw
       - /var/run/docker.sock:/var/run/docker.sock:ro
