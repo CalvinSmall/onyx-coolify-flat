@@ -1,0 +1,408 @@
+version: '3.8'
+
+# ============================================
+# ONYX LITE + CRAFT — Self-Hosted AI Platform
+# Optimized for Coolify (No Vespa, With Craft)
+# ============================================
+
+networks:
+  onyx-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  postgres_data:
+  redis_data:
+  file_connector_storage:
+  craft_sandbox_artifacts:
+
+services:
+  # ==========================================
+  # REVERSE PROXY (Coolify-managed SSL)
+  # ==========================================
+  # NOTE: Remove this if Coolify handles reverse proxy
+  # Coolify's built-in Traefik/nginx replaces this
+  # ==========================================
+
+  # ==========================================
+  # WEB FRONTEND (Next.js)
+  # ==========================================
+  web_server:
+    image: onyx-dot-app/onyx-web:latest
+    container_name: onyx-web
+    restart: unless-stopped
+    expose:
+      - "3000"
+    environment:
+      - INTERNAL_URL=http://api_server:8080
+      # Craft-specific: enable craft in UI
+      - ENABLE_CRAFT=true
+      - DOMAIN=${DOMAIN}
+      - WEB_DOMAIN=https://${DOMAIN}
+      # Security headers
+      - NEXT_TELEMETRY_DISABLED=1
+    networks:
+      onyx-network:
+        ipv4_address: 172.28.0.10
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # ==========================================
+  # API BACKEND (Python/FastAPI)
+  # ==========================================
+  api_server:
+    image: onyx-dot-app/onyx-backend:latest
+    container_name: onyx-api
+    restart: unless-stopped
+    expose:
+      - "8080"
+    environment:
+      # CORE CONFIGURATION
+      - DOMAIN=${DOMAIN}
+      - WEB_DOMAIN=https://${DOMAIN}
+      
+      # LITE MODE: Disable Vespa-specific features
+      # Uses Postgres full-text search instead
+      - ENABLE_LITE=True
+      - USE_VESPA=false
+      - DOCUMENT_ENCODER=hybrid  # Lite-compatible encoder
+      
+      # DATABASE
+      - POSTGRES_HOST=postgres
+      - POSTGRES_USER=${POSTGRES_USER:-onyx}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=onyx
+      - POSTGRES_PORT=5432
+      
+      # CACHE/QUEUE
+      - REDIS_HOST=redis
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - REDIS_PORT=6379
+      
+      # SECRETS
+      - SECRET=${SECRET}
+      
+      # AUTHENTICATION (Google OAuth recommended)
+      - AUTH_TYPE=${AUTH_TYPE:-google_oauth}
+      - GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID:-}
+      - GOOGLE_OAUTH_CLIENT_SECRET=${GOOGLE_OAUTH_CLIENT_SECRET:-}
+      
+      # Optional: Disable anonymous telemetry
+      - ENABLE_TELEMETRY=${ENABLE_TELEMETRY:-false}
+      - METRICS_DRIVER=${METRICS_DRIVER:-none}
+      
+      # CRAFT INTEGRATION
+      # Connects to craft-service for sandboxed code execution
+      - CRAFT_SERVICE_URL=http://craft-service:8081
+      - ENABLE_CRAFT=${ENABLE_CRAFT:-true}
+      
+      # LLM PROVIDER (OpenAI, Anthropic, Azure, Ollama)
+      - GENAI_MODEL_PROVIDER=${GENAI_MODEL_PROVIDER:-openai}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY:-}
+      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT:-}
+      - AZURE_OPENAI_DEPLOYMENT=${AZURE_OPENAI_DEPLOYMENT:-}
+      - OLLAMA_API_BASE=${OLLAMA_API_BASE:-http://host.docker.internal:11434}
+      
+      # Embeddings (Lite uses smaller local models or API)
+      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-openai}
+      - OPENAI_EMBEDDING_API_KEY=${OPENAI_EMBEDDING_API_KEY:-${OPENAI_API_KEY}}
+      - EMBEDDING_MODEL=text-embedding-ada-002
+      
+      # FILE HANDLING
+      - FILE_CONNECTOR_TMP_STORAGE_PATH=/tmp/file_storage
+      - FILE_CONNECTOR_S3_BUCKET=${FILE_CONNECTOR_S3_BUCKET:-}
+      
+      # LOGGING
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - LOG_MAX_BYTES=10485760
+      - LOG_BACKUP_COUNT=5
+      
+      # SECURITY
+      - DISABLE_LLM_QUERY_FILTER=${DISABLE_LLM_QUERY_FILTER:-false}
+      - REQUIRE_EMAIL_VERIFICATION=${REQUIRE_EMAIL_VERIFICATION:-true}
+      - MAX_FILE_SIZE_BYTES=52428800  # 50MB
+      
+    volumes:
+      - file_connector_storage:/tmp/file_storage:rw
+      # CRAFT: Shared volume for artifact exchange
+      - craft_sandbox_artifacts:/tmp/craft_artifacts:rw
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      craft-service:
+        condition: service_started
+    networks:
+      onyx-network:
+        ipv4_address: 172.28.0.20
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ==========================================
+  # BACKGROUND WORKERS (Celery)
+  # ==========================================
+  background:
+    image: onyx-dot-app/onyx-backend:latest
+    container_name: onyx-background
+    restart: unless-stopped
+    command: >
+      sh -c "
+        echo 'Running database migrations...' &&
+        alembic upgrade head &&
+        echo 'Starting Celery workers...' &&
+        celery -A onyx.background.celery worker 
+        -Q vespa,celery,default 
+        --loglevel=INFO 
+        --concurrency=4 
+        -n background@%h
+      "
+    environment:
+      - DOMAIN=${DOMAIN}
+      - WEB_DOMAIN=https://${DOMAIN}
+      - ENABLE_LITE=True
+      - USE_VESPA=false
+      
+      - POSTGRES_HOST=postgres
+      - POSTGRES_USER=${POSTGRES_USER:-onyx}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=onyx
+      
+      - REDIS_HOST=redis
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      
+      - SECRET=${SECRET}
+      
+      - AUTH_TYPE=${AUTH_TYPE:-google_oauth}
+      - GOOGLE_OAUTH_CLIENT_ID=${GOOGLE_OAUTH_CLIENT_ID:-}
+      - GOOGLE_OAUTH_CLIENT_SECRET=${GOOGLE_OAUTH_CLIENT_SECRET:-}
+      
+      - GENAI_MODEL_PROVIDER=${GENAI_MODEL_PROVIDER:-openai}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      
+      - EMBEDDING_PROVIDER=${EMBEDDING_PROVIDER:-openai}
+      - OPENAI_EMBEDDING_API_KEY=${OPENAI_EMBEDDING_API_KEY:-${OPENAI_API_KEY}}
+      
+      - FILE_CONNECTOR_TMP_STORAGE_PATH=/tmp/file_storage
+      - ENABLE_CRAFT=${ENABLE_CRAFT:-true}
+      - CRAFT_SERVICE_URL=http://craft-service:8081
+      
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - NUM_WORKERS=4
+      
+    volumes:
+      - file_connector_storage:/tmp/file_storage:rw
+      - craft_sandbox_artifacts:/tmp/craft_artifacts:rw
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      craft-service:
+        condition: service_started
+    networks:
+      onyx-network:
+        ipv4_address: 172.28.0.30
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+
+  # ==========================================
+  # CRAFT SERVICE — Sandboxed Code Execution
+  # ==========================================
+  # SECURITY CRITICAL: This executes untrusted user code
+  # ==========================================
+  craft-service:
+    image: onyx-dot-app/onyx-craft:latest
+    container_name: onyx-craft
+    restart: unless-stopped
+    expose:
+      - "8081"
+    environment:
+      - PORT=8081
+      - SANDBOX_TIMEOUT=120  # seconds
+      - MAX_MEMORY_MB=512
+      - MAX_OUTPUT_LENGTH=10000
+      - WHITELISTED_MODULES=numpy,pandas,matplotlib,requests,beautifulsoup4
+      - LOG_LEVEL=INFO
+      
+      # Security: Disable dangerous operations
+      - DISABLE_NETWORKING=false  # Allow API calls (set true for air-gapped)
+      - ALLOWED_HOSTS=${DOMAIN},api.openai.com,anthropic.com
+      
+    volumes:
+      # Shared artifacts with API/Background
+      - craft_sandbox_artifacts:/tmp/craft_artifacts:rw
+      
+      # ⚠️ SECURITY RISK: Docker socket for containerized sandbox
+      # Craft uses this to spawn isolated execution containers
+      # Alternative: Use Kubernetes-like sandboxing (more secure)
+      # For production hardening, consider rootless Podman or gVisor
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      
+    networks:
+      onyx-network:
+        ipv4_address: 172.28.0.40
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:unconfined  # Required for sandbox container creation
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE  # Required for Docker socket operations
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+    # Health check for craft service
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ==========================================
+  # POSTGRESQL (Full-Text Search Enabled — Lite Mode)
+  # ==========================================
+  # In Lite mode, Postgres replaces Vespa for document search
+  # Requires pg_trgm extension for similarity search
+  # ==========================================
+  postgres:
+    image: pgvector/pgvector:pg15
+    container_name: onyx-postgres
+    restart: unless-stopped
+    expose:
+      - "5432"
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-onyx}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=onyx
+      
+      # Performance tuning for search workloads
+      - POSTGRES_SHARED_PRELOAD_LIBRARIES=pg_stat_statements
+      - POSTGRES_MAX_CONNECTIONS=200
+      
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Init script to enable extensions
+      - type: bind
+        source: ./init-db/init.sql
+        target: /docker-entrypoint-initdb.d/01-init.sql
+        read_only: true
+    networks:
+      onyx-network:
+        ipv4_address: 172.28.0.50
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 4G
+        reservations:
+          cpus: '0.5'
+          memory: 1G
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # ==========================================
+  # REDIS (Cache, Locks, Celery Broker)
+  # ==========================================
+  redis:
+    image: redis:7-alpine
+    container_name: onyx-redis
+    restart: unless-stopped
+    command: >
+      redis-server 
+      --requirepass ${REDIS_PASSWORD}
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+      --appendfsync everysec
+    expose:
+      - "6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      onyx-network:
+        ipv4_address: 172.28.0.60
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ==========================================
+  # OPTIONAL: Litestream for Postgres Backups
+  # ==========================================
+  # Uncomment for continuous backups to S3/B2
+  # ==========================================
+  # litestream:
+  #   image: litestream/litestream:latest
+  #   container_name: onyx-litestream
+  #   restart: unless-stopped
+  #   volumes:
+  #     - postgres_data:/data
+  #     - ./litestream.yml:/etc/litestream.yml:ro
+  #   command: replicate
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   networks:
+  #     - onyx-network
