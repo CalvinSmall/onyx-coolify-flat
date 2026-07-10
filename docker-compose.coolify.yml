@@ -1,0 +1,611 @@
+# =============================================================================
+# ONYX FULL + CRAFT (CODE SANDBOX) — COOLIFY SERVICE DEPLOYMENT
+# =============================================================================
+# Self-contained docker-compose file for deploying Onyx as a Coolify Service.
+# Merges docker-compose.onyx-lite.yml + docker-compose.craft.yml with a
+# Docker-in-Docker (dind) sandbox backend for host isolation.
+#
+# DISABLE_VECTOR_DB is NOT set — Craft requires vector-DB-backed background
+# worker tasks, so OpenSearch is a real service in this deployment.
+#
+# ═══════════════════════════════════════════════════════════════════════════════
+# ══  COOLIFY ADAPTATIONS (vs. standalone docker-compose.coolify.yml):
+# ═══════════════════════════════════════════════════════════════════════════════
+#   ✗ No custom networks        — Coolify auto-creates an isolated bridge network
+#   ✗ No `name:` directive      — Coolify manages stack naming
+#   ✗ No `build:` sections      — Service deployments use pre-built images only
+#   ✓ `exclude_from_hc: true`   — Stub services don't affect health checks
+#   ✓ Traefik labels            — Optional SSL via Coolify's proxy (commented)
+#   ✓ `SANDBOX_PROXY_BIND`      — Defaults to 0.0.0.0 (dind sandbox access)
+#   ✓ nginx path                — Uses ./deployment/data/nginx (compose at root)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# ARCHITECTURE:
+#   ┌──────────────────────────────────────────────────────────────────┐
+#   │ HOST (Coolify + other apps live here)                            │
+#   │                                                                  │
+#   │  ┌── ONYX COMPOSE (Coolify-managed bridge network) ──────────┐  │
+#   │  │                                                             │  │
+#   │  │  api_server ──┐                                             │  │
+#   │  │  background ──┤── all connect to dind socket                │  │
+#   │  │  sandbox-proxy┤   (NOT the host socket!)                    │  │
+#   │  │  code-interp ─┘                                             │  │
+#   │  │           │                                                 │  │
+#   │  │    ┌──────▼──────────────┐                                  │  │
+#   │  │    │ sandbox-dind        │ ← privileged: true               │  │
+#   │  │    │ (separate daemon)   │   (CONTAINED HERE)               │  │
+#   │  │    │                     │                                  │  │
+#   │  │    │  sandbox containers │ ← cannot see host                │  │
+#   │  │    │  (isolated)         │   Docker or Coolify              │  │
+#   │  │    └─────────────────────┘                                  │  │
+#   │  │                                                             │  │
+#   │  │  sandbox-proxy exposes port 8090 on host                    │  │
+#   │  │  → sandbox containers reach proxy via host bridge IP        │  │
+#   │  │                                                             │  │
+#   │  │  nginx: port 8080 on host (or via Coolify Traefik)          │  │
+#   │  └─────────────────────────────────────────────────────────────┘  │
+#   │                                                                  │
+#   │  /var/run/docker.sock ← NEVER mounted into Onyx                  │
+#   └──────────────────────────────────────────────────────────────────┘
+#
+# WHAT THIS DEPLOYS (Full Onyx + Craft):
+#   - api_server, web_server, nginx, relational_db (PostgreSQL)
+#   - cache (Redis — KEPT, required by sandbox-proxy)
+#   - background worker (KEPT, required for Craft idle cleanup)
+#   - sandbox-dind (Docker-in-Docker daemon for sandbox isolation)
+#   - sandbox-proxy (egress proxy + approval gating for sandboxes)
+#   - code-interpreter (standalone code execution)
+#
+# WHAT IS STUBBED (not needed for this deployment):
+#   - inference_model_server     → alpine stub (exclude_from_hc)
+#   - indexing_model_server      → alpine stub (exclude_from_hc)
+#   - MinIO (S3 file store)      → FILE_STORE_BACKEND=postgres
+#
+# =============================================================================
+# COOLIFY PRE-FLIGHT CHECKLIST
+# =============================================================================
+#
+# 1. RUN THE ONE-TIME SETUP on the host (SSH in):
+#      cd deployment/docker_compose && bash pre-deploy.sh
+#    This creates the sandbox_proxy_ca volume and auto-detects the bridge IP
+#    (written to /tmp/onyx-generated.env, picked up by the compose file).
+#
+# 2. IN COOLIFY UI:
+#    a) New Resource → Service → Docker Compose Empty
+#    b) Paste this entire compose file
+#    c) Fill in required environment variables:
+#       - GEN_AI_API_KEY (your LLM provider key)
+#       - USER_AUTH_SECRET (generate: openssl rand -hex 32)
+#       - SANDBOX_API_SERVER_URL (your public Onyx URL)
+#       - SANDBOX_PROXY_HOST (from step 2, typically 172.17.0.1)
+#       - POSTGRES_PASSWORD (change from default!)
+#    d) Optional: Enable "Connect to Predefined Networks" if you need
+#       cross-stack communication (e.g., external databases)
+#    e) Deploy
+#
+# 4. ACCESS ONYX:
+#    - Direct: http://<server-ip>:8080
+#    - With Coolify SSL: Add a domain + Traefik labels (see COOLIFY_SETUP.md)
+#
+# =============================================================================
+# SECURITY MODEL — WHY DIND?
+# =============================================================================
+# The host's /var/run/docker.sock is NEVER mounted into any Onyx container.
+# Instead, a dedicated docker:dind container runs a separate Docker daemon.
+# All Onyx services connect to the dind socket via a shared volume.
+#
+# IF A SANDBOX CONTAINER IS COMPROMISED:
+#   - It escapes into the dind daemon, NOT the host
+#   - It cannot see the host's Docker socket
+#   - It cannot enumerate Coolify's other containers
+#   - It cannot read other applications' environment variables
+#   - The dind daemon can be restarted independently
+#
+# REMAINING RISKS:
+#   - sandbox-dind runs with privileged: true (required for dind).
+#     A kernel exploit from within dind could still reach the host.
+#   - sandbox-proxy port 8090 is exposed on the host (needed for sandbox
+#     containers to reach the proxy via the bridge gateway).
+#     Consider firewall rules to restrict access to the bridge subnet only.
+#   - Resource exhaustion: sandbox containers share the dind daemon's
+#     resources. Set SANDBOX_DOCKER_MEMORY_LIMIT and CPU_LIMIT aggressively.
+# =============================================================================
+
+services:
+  # ===========================================================================
+  # API SERVER — The core Onyx backend
+  # ===========================================================================
+  api_server:
+    image: ${ONYX_BACKEND_IMAGE:-onyxdotapp/onyx-backend:${IMAGE_TAG:-latest}}
+    command: >
+      /bin/sh -c "alembic upgrade head &&
+      echo \"Starting Onyx Api Server\" &&
+      uvicorn onyx.main:app --host 0.0.0.0 --port 8080"
+    env_file:
+      - path: .env
+        required: false
+      - path: /tmp/onyx-generated.env
+        required: false
+    depends_on:
+      relational_db:
+        condition: service_healthy
+      cache:
+        condition: service_started
+      # OpenSearch is required for Craft (real service, not stubbed)
+      opensearch:
+        condition: service_started
+      inference_model_server:
+        condition: service_started
+        required: false
+      minio:
+        condition: service_started
+        required: false
+      # Craft: sandbox-proxy and dind must be healthy before api_server starts
+      sandbox-dind:
+        condition: service_healthy
+      sandbox-proxy:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      # --- Auth ---
+      - AUTH_TYPE=${AUTH_TYPE:-basic}
+      # --- Lite mode: use Postgres for everything ---
+      # Full mode: OpenSearch is enabled for Craft support
+      - FILE_STORE_BACKEND=postgres
+      - CACHE_BACKEND=${CACHE_BACKEND:-redis}
+      - AUTH_BACKEND=postgres
+      # --- Service hosts ---
+      - POSTGRES_HOST=${POSTGRES_HOST:-relational_db}
+      - OPENSEARCH_HOST=${OPENSEARCH_HOST:-opensearch}
+      - OPENSEARCH_ADMIN_PASSWORD=${OPENSEARCH_ADMIN_PASSWORD:-StrongPassword123!}
+      - REDIS_HOST=${REDIS_HOST:-cache}
+      - MODEL_SERVER_HOST=${MODEL_SERVER_HOST:-inference_model_server}
+      - CODE_INTERPRETER_BASE_URL=${CODE_INTERPRETER_BASE_URL:-http://code-interpreter:8000}
+      - S3_ENDPOINT_URL=${S3_ENDPOINT_URL:-http://minio:9000}
+      - S3_AWS_ACCESS_KEY_ID=${S3_AWS_ACCESS_KEY_ID:-minioadmin}
+      - S3_AWS_SECRET_ACCESS_KEY=${S3_AWS_SECRET_ACCESS_KEY:-minioadmin}
+      # --- Craft / Sandbox (dind backend) ---
+      - ENABLE_CRAFT=${ENABLE_CRAFT:-true}
+      - SANDBOX_BACKEND=${SANDBOX_BACKEND:-docker}
+      - SANDBOX_API_SERVER_URL=${SANDBOX_API_SERVER_URL:-}
+      - SANDBOX_CONTAINER_IMAGE=${SANDBOX_CONTAINER_IMAGE:-onyxdotapp/sandbox:${IMAGE_TAG:-latest}}
+      # Sandbox containers run on the dind daemon's default bridge network.
+      - SANDBOX_DOCKER_NETWORK=bridge
+      - SANDBOX_DOCKER_MEMORY_LIMIT=${SANDBOX_DOCKER_MEMORY_LIMIT:-2g}
+      - SANDBOX_DOCKER_CPU_LIMIT=${SANDBOX_DOCKER_CPU_LIMIT:-1.0}
+      - ENABLE_OPENCODE_DEBUGGING=${ENABLE_OPENCODE_DEBUGGING:-false}
+      # Point to the dind socket, NOT the host socket
+      - SANDBOX_DOCKER_SOCKET=/var/run/dind/docker.sock
+      - OPENCODE_SERVE_PORT=4096
+      # Proxy host/port: sandbox containers reach the proxy through the host
+      # network stack. Set SANDBOX_PROXY_HOST to your Docker bridge gateway IP
+      # (typically 172.17.0.1). The external port (8090) is mapped to the
+      # proxy's internal port (8080).
+      - SANDBOX_PROXY_HOST=${SANDBOX_PROXY_HOST:-172.17.0.1}
+      - SANDBOX_PROXY_PORT=${SANDBOX_PROXY_PORT:-8090}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - api_server_logs:/var/log/onyx
+      - file-system:/app/file-system
+      # DIND: Mount the dind socket volume (NOT the host socket)
+      - dind_socket:/var/run/dind
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "6"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')",
+        ]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+      start_period: 600s
+
+  # ===========================================================================
+  # BACKGROUND WORKER — Kept for Craft idle-sandbox cleanup tasks
+  # ===========================================================================
+  background:
+    image: ${ONYX_BACKEND_IMAGE:-onyxdotapp/onyx-backend:${IMAGE_TAG:-latest}}
+    command: >
+      /bin/sh -c "
+      if [ -f /etc/ssl/certs/custom-ca.crt ]; then
+        update-ca-certificates;
+      fi &&
+      /app/scripts/supervisord_entrypoint.sh"
+    env_file:
+      - path: .env
+        required: false
+      - path: /tmp/onyx-generated.env
+        required: false
+    depends_on:
+      relational_db:
+        condition: service_healthy
+      cache:
+        condition: service_started
+      opensearch:
+        condition: service_started
+      inference_model_server:
+        condition: service_started
+        required: false
+      indexing_model_server:
+        condition: service_started
+        required: false
+      sandbox-dind:
+        condition: service_healthy
+      sandbox-proxy:
+        condition: service_healthy
+    restart: unless-stopped
+    environment:
+      - FILE_STORE_BACKEND=${FILE_STORE_BACKEND:-postgres}
+      - POSTGRES_HOST=${POSTGRES_HOST:-relational_db}
+      - OPENSEARCH_HOST=${OPENSEARCH_HOST:-opensearch}
+      - OPENSEARCH_ADMIN_PASSWORD=${OPENSEARCH_ADMIN_PASSWORD:-StrongPassword123!}
+      - REDIS_HOST=${REDIS_HOST:-cache}
+      - MODEL_SERVER_HOST=${MODEL_SERVER_HOST:-inference_model_server}
+      - INDEXING_MODEL_SERVER_HOST=${INDEXING_MODEL_SERVER_HOST:-indexing_model_server}
+      - S3_ENDPOINT_URL=${S3_ENDPOINT_URL:-http://minio:9000}
+      - S3_AWS_ACCESS_KEY_ID=${S3_AWS_ACCESS_KEY_ID:-minioadmin}
+      - S3_AWS_SECRET_ACCESS_KEY=${S3_AWS_SECRET_ACCESS_KEY:-minioadmin}
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
+      - DISCORD_BOT_INVOKE_CHAR=${DISCORD_BOT_INVOKE_CHAR:-!}
+      - API_SERVER_PROTOCOL=${API_SERVER_PROTOCOL:-http}
+      - API_SERVER_HOST=${API_SERVER_HOST:-api_server}
+      - ENABLE_CRAFT=${ENABLE_CRAFT:-true}
+      # Craft sandbox config — must match api_server
+      - SANDBOX_BACKEND=${SANDBOX_BACKEND:-docker}
+      - SANDBOX_API_SERVER_URL=${SANDBOX_API_SERVER_URL:-}
+      - SANDBOX_CONTAINER_IMAGE=${SANDBOX_CONTAINER_IMAGE:-onyxdotapp/sandbox:${IMAGE_TAG:-latest}}
+      - SANDBOX_DOCKER_NETWORK=bridge
+      - SANDBOX_DOCKER_MEMORY_LIMIT=${SANDBOX_DOCKER_MEMORY_LIMIT:-2g}
+      - SANDBOX_DOCKER_CPU_LIMIT=${SANDBOX_DOCKER_CPU_LIMIT:-1.0}
+      - ENABLE_OPENCODE_DEBUGGING=${ENABLE_OPENCODE_DEBUGGING:-false}
+      - SANDBOX_DOCKER_SOCKET=/var/run/dind/docker.sock
+      - OPENCODE_SERVE_PORT=4096
+      - SANDBOX_PROXY_HOST=${SANDBOX_PROXY_HOST:-172.17.0.1}
+      - SANDBOX_PROXY_PORT=${SANDBOX_PROXY_PORT:-8090}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - background_logs:/var/log/onyx
+      - file-system:/app/file-system
+      # DIND: Mount the dind socket volume (NOT the host socket)
+      - dind_socket:/var/run/dind
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "6"
+
+  # ===========================================================================
+  # WEB SERVER — Next.js frontend
+  # ===========================================================================
+  # NOTE: No `build:` section — Coolify Service deployments use pre-built images.
+  # The image is pulled from Docker Hub automatically.
+  web_server:
+    image: ${ONYX_WEB_SERVER_IMAGE:-onyxdotapp/onyx-web-server:${IMAGE_TAG:-latest}}
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      - api_server
+    restart: unless-stopped
+    environment:
+      - INTERNAL_URL=${INTERNAL_URL:-http://api_server:8080}
+    # ── Coolify Traefik labels (uncomment for SSL via Coolify's proxy) ──
+    # To use these, you also need to:
+    #   1. Enable "Connect to Predefined Networks" on the Service
+    #   2. Add a domain in Coolify's UI
+    #   3. Remove the nginx port mapping below (or remove nginx entirely)
+    # labels:
+    #   - traefik.enable=true
+    #   - "traefik.http.routers.onyx-web.rule=Host(`onyx.your-domain.com`)"
+    #   - traefik.http.routers.onyx-web.entryPoints=https
+    #   - traefik.http.services.onyx-web.loadbalancer.server.port=3000
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "require('http').get('http://127.0.0.1:3000/', (r) => process.exit(r.statusCode < 500 ? 0 : 1)).on('error', () => process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ===========================================================================
+  # RELATIONAL DATABASE — PostgreSQL (only DB needed in Lite mode)
+  # ===========================================================================
+  relational_db:
+    image: ${BASE_IMAGE_REGISTRY:-docker.io}/library/postgres:15.2-alpine
+    shm_size: 1g
+    command: -c 'max_connections=250'
+    env_file:
+      - path: .env
+        required: false
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-password}
+    # COOLIFY: Do NOT expose ports — internal compose network only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - db_volume:/var/lib/postgresql/data
+
+  # ===========================================================================
+  # OPENSEARCH — Vector database (required for Craft)
+  # ===========================================================================
+  opensearch:
+    image: ${BASE_IMAGE_REGISTRY:-docker.io}/opensearchproject/opensearch:3.6.0
+    restart: unless-stopped
+    environment:
+      - discovery.type=single-node
+      - OPENSEARCH_INITIAL_ADMIN_PASSWORD=${OPENSEARCH_ADMIN_PASSWORD:-StrongPassword123!}
+      - bootstrap.memory_lock=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms2g -Xmx2g"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "6"
+
+  # ===========================================================================
+  # CACHE — Redis (KEPT — required by sandbox-proxy for approval gating)
+  # ===========================================================================
+  cache:
+    image: ${BASE_IMAGE_REGISTRY:-docker.io}/library/redis:7.4-alpine
+    restart: unless-stopped
+    command: redis-server --save "" --appendonly no
+    env_file:
+      - path: .env
+        required: false
+    tmpfs:
+      - /data
+
+  # ===========================================================================
+  # NGINX — Reverse proxy (entry point for all HTTP traffic)
+  # ===========================================================================
+  # COOLIFY OPTIONS:
+  #   A) Keep nginx + port mapping (default below) — simplest, no Coolify SSL
+  #   B) Keep nginx + Traefik labels — SSL via Coolify proxy (see labels below)
+  #   C) Remove nginx, use Traefik labels on web_server — most Coolify-native
+  #
+  # Option A (default): Access Onyx at http://<server-ip>:8080
+  # Option B: Uncomment the labels below, add domain in Coolify UI
+  # Option C: Remove this service entirely, set up Traefik on web_server
+  nginx:
+    image: ${BASE_IMAGE_REGISTRY:-docker.io}/library/nginx:1.25.5-alpine
+    restart: unless-stopped
+    depends_on:
+      api_server:
+        condition: service_healthy
+      web_server:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - DOMAIN=${DOMAIN:-localhost}
+      - NGINX_PROXY_CONNECT_TIMEOUT=${NGINX_PROXY_CONNECT_TIMEOUT:-300}
+      - NGINX_PROXY_SEND_TIMEOUT=${NGINX_PROXY_SEND_TIMEOUT:-300}
+      - NGINX_PROXY_READ_TIMEOUT=${NGINX_PROXY_READ_TIMEOUT:-300}
+      - ONYX_BACKEND_API_HOST=${ONYX_BACKEND_API_HOST:-api_server}
+      - ONYX_WEB_SERVER_HOST=${ONYX_WEB_SERVER_HOST:-web_server}
+    ports:
+      - "${HOST_PORT:-8080}:80"
+    # ── Coolify Traefik labels (uncomment for SSL via Coolify's proxy) ──
+    # labels:
+    #   - traefik.enable=true
+    #   - "traefik.http.routers.onyx-nginx.rule=Host(`onyx.your-domain.com`)"
+    #   - traefik.http.routers.onyx-nginx.entryPoints=https
+    #   - traefik.http.services.onyx-nginx.loadbalancer.server.port=80
+    volumes:
+      # When compose file is at repo root, use ./deployment/data/nginx
+      # When compose file is in deployment/docker_compose/, use ../data/nginx
+      - ./deployment/data/nginx:/nginx-templates:ro
+    command: >
+      /bin/sh -c "rm -f /etc/nginx/conf.d/default.conf
+      && cp -a /nginx-templates/. /etc/nginx/conf.d/
+      && sed 's/\r$//' /etc/nginx/conf.d/run-nginx.sh > /tmp/run-nginx.sh
+      && chmod +x /tmp/run-nginx.sh
+      && /tmp/run-nginx.sh app.conf.template"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--quiet",
+          "--tries=1",
+          "--spider",
+          "http://127.0.0.1/nginx-health",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "6"
+
+  # ===========================================================================
+  # CODE INTERPRETER — Standalone code execution (non-Craft, general use)
+  # ===========================================================================
+  code-interpreter:
+    image: onyxdotapp/code-interpreter:${CODE_INTERPRETER_IMAGE_TAG:-latest}
+    command: ["bash", "./entrypoint.sh", "code-interpreter-api"]
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    user: root
+    depends_on:
+      sandbox-dind:
+        condition: service_healthy
+    volumes:
+      # DIND: Code interpreter also uses the dind daemon for isolation
+      - dind_socket:/var/run/dind
+    environment:
+      - DOCKER_SOCK_PATH=/var/run/dind/docker.sock
+      - DOCKER_HOST=unix:///var/run/dind/docker.sock
+
+  # ===========================================================================
+  # SANDBOX PROXY — Egress proxy for Craft sandboxes
+  # ===========================================================================
+  sandbox-proxy:
+    image: ${ONYX_BACKEND_IMAGE:-onyxdotapp/onyx-backend:${IMAGE_TAG:-latest}}
+    command: ["python", "-m", "onyx.sandbox_proxy.server"]
+    env_file:
+      - path: .env
+        required: false
+      - path: /tmp/onyx-generated.env
+        required: false
+    environment:
+      - SANDBOX_BACKEND=docker
+      - POSTGRES_HOST=${POSTGRES_HOST:-relational_db}
+      - REDIS_HOST=${REDIS_HOST:-cache}
+      # DIND: proxy inspects sandbox containers on the dind daemon
+      - SANDBOX_DOCKER_SOCKET=/var/run/dind/docker.sock
+      - SANDBOX_DOCKER_NETWORK=bridge
+      - SANDBOX_PROXY_LISTEN_PORT=8080
+      - SANDBOX_PROXY_HEALTHZ_PORT=8081
+      - SANDBOX_API_SERVER_URL=${SANDBOX_API_SERVER_URL:-}
+    volumes:
+      - sandbox_proxy_ca:/var/lib/sandbox-proxy/ca
+      - dind_socket:/var/run/dind:ro
+    depends_on:
+      relational_db:
+        condition: service_healthy
+      cache:
+        condition: service_started
+      sandbox-dind:
+        condition: service_healthy
+    ports:
+      # ⚠️  SECURITY: Must bind to 0.0.0.0 (not 127.0.0.1) so dind sandbox
+      # containers can reach the proxy via the host bridge gateway IP.
+      # Restrict access with firewall rules to the Docker bridge subnet:
+      #   iptables -A INPUT -p tcp --dport 8090 ! -s 172.17.0.0/16 -j DROP
+      - "${SANDBOX_PROXY_BIND:-0.0.0.0}:${SANDBOX_PROXY_PORT:-8090}:8080"
+    restart: unless-stopped
+    stop_grace_period: 20s
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8081/healthz')",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "6"
+
+  # ===========================================================================
+  # SANDBOX DIND — Isolated Docker daemon for sandbox containers
+  # ===========================================================================
+  # Uses a dedicated volume subdirectory for the socket. All containers mount
+  # dind_socket at the same path (/var/run/dind), so the socket file created by
+  # dockerd at /var/run/dind/docker.sock is visible to all consumers at the
+  # same path. TCP on 2375 is also available for containers that prefer it.
+  sandbox-dind:
+    image: docker:dind
+    privileged: true
+    environment:
+      - DOCKER_TLS_CERTDIR=
+    command:
+      [
+        "--host",
+        "unix:///var/run/dind/docker.sock",
+        "--host",
+        "tcp://0.0.0.0:2375",
+      ]
+    volumes:
+      - dind_socket:/var/run/dind
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "docker", "info"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "6"
+
+  # ===========================================================================
+  # STUB SERVICES — Disabled in this deployment (kept for dependency resolution)
+  # ===========================================================================
+  # These services are replaced with lightweight alpine stubs so that
+  # `depends_on` references don't fail. They exit immediately and are
+  # excluded from Coolify's health checks.
+  #
+  # Using alpine:latest (direct, no variable) to avoid Docker Hub rate-limit
+  # issues on the Coolify server. These are ~3.5MB stubs that exit immediately.
+  # ===========================================================================
+
+  inference_model_server:
+    image: alpine:latest
+    command: ["echo", "Inference model server disabled in Lite mode"]
+    restart: "no"
+    exclude_from_hc: true
+
+  indexing_model_server:
+    image: alpine:latest
+    command: ["echo", "Indexing model server disabled in Lite mode"]
+    restart: "no"
+    exclude_from_hc: true
+
+  minio:
+    image: alpine:latest
+    command: ["echo", "MinIO disabled in Lite mode — using Postgres file store"]
+    restart: "no"
+    exclude_from_hc: true
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+# NOTE: Custom networks are intentionally NOT defined here.
+# Coolify auto-creates an isolated bridge network for this stack.
+# Defining custom networks causes intermittent 504 Gateway Timeout errors.
+# See: https://coolify.io/docs/knowledge-base/docker/compose#do-not-define-custom-networks
+# =============================================================================
+volumes:
+  db_volume:
+  opensearch-data:
+  api_server_logs:
+  background_logs:
+  file-system:
+  dind_socket:
+  sandbox_proxy_ca:
+    name: sandbox_proxy_ca
+    external: true
