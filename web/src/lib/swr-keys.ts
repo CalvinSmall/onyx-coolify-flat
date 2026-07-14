@@ -20,6 +20,7 @@ export const SWR_KEYS = {
   customAnalyticsScript: "/api/enterprise-settings/custom-analytics-script",
   authType: "/api/auth/type",
   adminSecuritySettings: "/api/admin/security",
+  adminSsoProviders: "/api/admin/sso/provider",
 
   // ── Agents / Personas ─────────────────────────────────────────────────────
   personas: "/api/persona",
@@ -151,6 +152,7 @@ export const SWR_KEYS = {
   buildExternalApps: "/api/build/apps",
   buildExternalAppsAdmin: "/api/build/admin/apps",
   buildExternalAppsBuiltInOptions: "/api/build/admin/apps/built-in/options",
+  buildBaseInstructions: "/api/build/admin/base-instructions",
   buildSessionLiveApprovals: (sessionId: string) =>
     `/api/build/approvals/sessions/${sessionId}/live`,
 
