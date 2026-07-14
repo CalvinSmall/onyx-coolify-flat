@@ -1,13 +1,14 @@
 # ============================================================================
 # ONYX LITE - COOLIFY DEPLOYMENT
 # ============================================================================
-# Minimal Onyx deployment for Coolify (Docker Compose buildpack)
+# Minimal Onyx deployment optimized for Coolify (Docker Compose buildpack)
 # - No vector database (DISABLE_VECTOR_DB=true)
 # - No Redis (uses PostgreSQL for cache)
 # - No model servers (bring your own LLM API)
 # - No background workers (API handles all work)
 # - No OpenSearch (no RAG indexing)
 # - No MinIO (uses PostgreSQL for file storage)
+# - No exposed ports (Coolify handles routing automatically)
 #
 # Core features that STILL WORK:
 # - LLM chat conversations
@@ -22,7 +23,8 @@
 # 2. Set Build Pack to "Docker Compose"
 # 3. Point to this docker-compose.yml
 # 4. Add environment variables from Coolify UI
-# 5. Configure storage volumes in Coolify UI
+# 5. Configure domain in Coolify UI (Coolify handles SSL)
+# 6. Configure storage volumes in Coolify UI
 # ============================================================================
 
 name: onyx
@@ -90,8 +92,7 @@ services:
         condition: service_healthy
       web_server:
         condition: service_healthy
-    ports:
-      - "${HOST_PORT:-3000}:80"
+    # No ports exposed - Coolify handles routing automatically
     environment:
       - DOMAIN=${DOMAIN:-localhost}
       - NGINX_PROXY_CONNECT_TIMEOUT=${NGINX_PROXY_CONNECT_TIMEOUT:-300}
