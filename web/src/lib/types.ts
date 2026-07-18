@@ -600,6 +600,8 @@ export enum ValidSources {
   Bitbucket = "bitbucket",
   TestRail = "testrail",
   Braintrust = "braintrust",
+  Lumapps = "lumapps",
+  Canvas = "canvas",
 
   // Craft-specific sources
   CraftFile = "craft_file",
@@ -627,6 +629,7 @@ export const validAutoSyncSources = [
   ValidSources.GitHub,
   ValidSources.Sharepoint,
   ValidSources.Teams,
+  ValidSources.Canvas,
 ] as const;
 
 // Create a type from the array elements
